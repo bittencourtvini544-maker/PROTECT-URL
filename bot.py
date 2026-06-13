@@ -76,6 +76,11 @@ async def send_log(guild, embed):
         if not log_channel_id:
             return
         channel = guild.get_channel(int(log_channel_id))
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(int(log_channel_id))
+            except Exception:
+                channel = None
         if channel:
             await channel.send(embed=embed)
     except Exception as e:
@@ -501,22 +506,31 @@ async def on_guild_update(before, after):
         revertido = False
         metodo_revert = "Nenhum"
 
-        # ── 1. Tenta reverter com a conta configurada via !setar (prioridade) ──
         setar_token = guild_data.get("setar_token", None)
         nome_conta  = guild_data.get("setar_conta", "conta configurada")
 
+        # ── Revert forcado pela conta configurada ──
         if setar_token:
-            revertido = await revert_vanity_with_token(after.id, protected_code, setar_token)
-            if revertido:
-                metodo_revert = f"Conta: {nome_conta}"
-                print(f"[SETAR] URL revertida pela conta '{nome_conta}' em {after.name}", flush=True)
+            # Tenta ate 3 vezes para garantir o revert
+            for tentativa in range(1, 4):
+                revertido = await revert_vanity_with_token(after.id, protected_code, setar_token)
+                if revertido:
+                    metodo_revert = f"Conta: {nome_conta}"
+                    print(f"[SETAR] URL revertida pela conta '{nome_conta}' em {after.name} (tentativa {tentativa})", flush=True)
+                    break
+                else:
+                    print(f"[SETAR] Tentativa {tentativa} de revert falhou em {after.name}", flush=True)
+                    await asyncio.sleep(1)
 
-        # ── 2. Fallback: tenta reverter com o proprio bot ──
-        if not revertido:
+            if not revertido:
+                print(f"[SETAR] Todas as tentativas falharam em {after.name}. Token invalido ou sem permissao.", flush=True)
+
+        else:
+            # Sem conta configurada: tenta com o proprio bot como unico fallback
             try:
                 await after.edit(vanity_code=protected_code, reason="BOT-YOV: Revertendo troca de URL nao autorizada")
                 revertido = True
-                metodo_revert = "Bot (fallback)"
+                metodo_revert = "Bot"
                 print(f"[BOT] URL revertida pelo bot em {after.name}", flush=True)
             except discord.Forbidden:
                 pass
@@ -526,16 +540,16 @@ async def on_guild_update(before, after):
         # ── Log de falha total ──
         if not revertido:
             aviso = (
-                "Nenhuma conta conseguiu reverter a URL.\n"
-                "Verifique se a conta configurada ainda esta no servidor e se o token e valido."
+                f"A conta **{nome_conta}** nao conseguiu reverter a URL apos 3 tentativas.\n"
+                "Verifique se o token ainda e valido e se a conta tem permissao de Gerenciar Servidor."
                 if setar_token else
                 "Nenhuma conta de revert configurada e o bot nao tem permissao.\n"
                 "Use `!setar` para configurar uma conta membro do servidor."
             )
             log_embed = discord.Embed(
-                title="ERRO - URL nao revertida",
+                title="ERRO — URL nao revertida",
                 description=aviso,
-                color=BLACK,
+                color=discord.Color.red(),
                 timestamp=datetime.now(timezone.utc)
             )
             await send_log(after, log_embed)
@@ -559,37 +573,17 @@ async def on_guild_update(before, after):
         })
 
         log_embed = discord.Embed(
-            title="BAN APLICADO - Troca de URL Bloqueada",
+            title="BAN APLICADO — Troca de URL Bloqueada",
             color=BLACK,
             timestamp=datetime.now(timezone.utc)
         )
         log_embed.add_field(name="URL Protegida", value=f"`discord.gg/{protected_code}`", inline=False)
         log_embed.add_field(name="URL tentada", value=f"`discord.gg/{current_code}`" if current_code else "`desconhecida`", inline=False)
         log_embed.add_field(name="Usuario Banido", value=str(culprit) if culprit else "Nao identificado", inline=False)
-        log_embed.add_field(name="URL Revertida", value=f"Sim — {metodo_revert}" if revertido else "Nao (verifique permissoes)", inline=False)
+        log_embed.add_field(name="URL Revertida", value=f"Sim — {metodo_revert}" if revertido else "Nao (verifique token/permissoes)", inline=False)
         log_embed.add_field(name="Quando", value=now, inline=False)
         log_embed.set_footer(text="BOT-YOV | Protecao de URL do Servidor")
         await send_log(after, log_embed)
-
-        try:
-            log_channel_id = get_log_channel(after.id)
-            if log_channel_id:
-                channel = after.get_channel(int(log_channel_id))
-                if channel:
-                    embed_aviso = discord.Embed(
-                        title="Tentativa de troca de URL bloqueada",
-                        description=(
-                            f"URL revertida para `discord.gg/{protected_code}` por **{metodo_revert}**"
-                            if revertido else
-                            "Nao foi possivel reverter. Verifique permissoes."
-                        ),
-                        color=BLACK
-                    )
-                    if culprit:
-                        embed_aviso.add_field(name="Responsavel banido", value=str(culprit), inline=False)
-                    await channel.send(embed=embed_aviso)
-        except Exception:
-            pass
 
     except Exception as e:
         print(f"[ANTI-CRASH] on_guild_update: {e}", flush=True)

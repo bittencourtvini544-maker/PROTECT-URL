@@ -104,32 +104,40 @@ def encrypt_password(password: str) -> str:
     """Armazena a senha com hash SHA-256 (nao reversivel, apenas para verificacao)."""
     return hashlib.sha256(password.encode()).hexdigest()
 
-async def verificar_membro_no_servidor(guild_id: int, token: str) -> tuple[bool, str]:
+async def verificar_membro_por_id(guild_id: int, user_id: int) -> tuple[bool, str]:
     """
-    Verifica se a conta do token e membro do servidor.
-    Qualquer conta que esteja no servidor pode ser configurada.
+    Verifica se o usuario com user_id e membro do servidor usando o token do bot.
     Retorna (esta_no_servidor: bool, nome_conta: str).
     """
-    headers = {"Authorization": token}
     nome_conta = "Desconhecido"
+    try:
+        guild = bot.get_guild(guild_id)
+        if guild is None:
+            return False, nome_conta
+        try:
+            member = await guild.fetch_member(user_id)
+            nome_conta = member.display_name or member.name
+            return True, nome_conta
+        except discord.NotFound:
+            return False, nome_conta
+    except Exception as e:
+        print(f"[SETAR] Erro ao verificar membro por ID: {e}", flush=True)
+        return False, nome_conta
 
+async def obter_id_pelo_token(token: str) -> str | None:
+    """Retorna o user ID da conta do token, ou None se invalido."""
     try:
         async with aiohttp.ClientSession() as sess:
             async with sess.get(
-                f"https://discord.com/api/v10/guilds/{guild_id}/members/@me",
-                headers=headers
+                "https://discord.com/api/v10/users/@me",
+                headers={"Authorization": token}
             ) as resp:
-                if resp.status != 200:
-                    return False, nome_conta
-                member_data = await resp.json()
-
-            user = member_data.get("user", {})
-            nome_conta = user.get("username", "Desconhecido")
-            return True, nome_conta
-
-    except Exception as e:
-        print(f"[SETAR] Erro ao verificar membro: {e}", flush=True)
-        return False, nome_conta
+                if resp.status == 200:
+                    data = await resp.json()
+                    return str(data.get("id", ""))
+    except Exception:
+        pass
+    return None
 
 async def revert_vanity_with_token(guild_id: int, vanity_code: str, token: str) -> bool:
     """Usa o token configurado para reverter a URL via API REST do Discord."""
@@ -224,10 +232,66 @@ async def on_message(message):
                     ))
                     del setup_sessions[user_id]
                     return
-                setup_sessions[user_id]["step"] = "token"
+                setup_sessions[user_id]["step"] = "user_id"
                 await message.channel.send(embed=discord.Embed(
                     title="Senha Correta!",
-                    description="Agora envie o **novo token** da conta de reversao:",
+                    description=(
+                        "**Passo 1 de 4 — ID da Conta**\n\n"
+                        "Envie o **ID** da conta que vai fazer a reversao:\n"
+                        "*(Clique com o botao direito na conta → Copiar ID)*"
+                    ),
+                    color=BLACK
+                ))
+                return
+
+            # ── Receber ID da conta ──
+            elif step == "user_id":
+                id_input = message.content.strip()
+
+                if not id_input.isdigit():
+                    await message.channel.send(embed=discord.Embed(
+                        title="ID invalido",
+                        description="O ID precisa conter apenas numeros. Tente novamente:",
+                        color=discord.Color.red()
+                    ))
+                    return
+
+                conta_id_input = int(id_input)
+                guild = bot.get_guild(guild_id)
+                guild_name = guild.name if guild else str(guild_id)
+
+                verificando = await message.channel.send(embed=discord.Embed(
+                    title="Verificando ID...",
+                    description="Aguarde, estou verificando se a conta esta no servidor.",
+                    color=BLACK
+                ))
+
+                esta_no_servidor, nome_conta = await verificar_membro_por_id(guild_id, conta_id_input)
+                await verificando.delete()
+
+                if not esta_no_servidor:
+                    await message.channel.send(embed=discord.Embed(
+                        title="Conta nao esta no servidor",
+                        description=(
+                            f"O ID `{id_input}` nao foi encontrado no servidor **{guild_name}**.\n\n"
+                            "A conta precisa ser membro do servidor.\n"
+                            "Verifique o ID e tente novamente:"
+                        ),
+                        color=discord.Color.red()
+                    ))
+                    return
+
+                setup_sessions[user_id]["conta_id"] = str(conta_id_input)
+                setup_sessions[user_id]["nome_conta"] = nome_conta
+                setup_sessions[user_id]["step"] = "token"
+
+                await message.channel.send(embed=discord.Embed(
+                    title=f"Conta encontrada: {nome_conta}",
+                    description=(
+                        f"ID `{id_input}` confirmado no servidor.\n\n"
+                        "**Passo 2 de 4 — Token da Conta**\n\n"
+                        "Envie o **token** desta conta:"
+                    ),
                     color=BLACK
                 ))
                 return
@@ -236,71 +300,49 @@ async def on_message(message):
             elif step == "token":
                 token_input = message.content.strip()
 
-                verificando = discord.Embed(
+                verificando = await message.channel.send(embed=discord.Embed(
                     title="Verificando token...",
-                    description="Aguarde, estou validando o token e verificando se a conta esta no servidor.",
+                    description="Aguarde, estou validando o token.",
                     color=BLACK
-                )
-                msg_verificando = await message.channel.send(embed=verificando)
+                ))
 
-                # Passo 1: token valido?
+                # Verifica se o token e valido
                 token_ok = await validar_token(token_input)
                 if not token_ok:
-                    await msg_verificando.delete()
+                    await verificando.delete()
                     await message.channel.send(embed=discord.Embed(
                         title="Token Invalido",
-                        description="O token fornecido e invalido. Operacao cancelada.\nUse `!setar` novamente para tentar de novo.",
+                        description="O token fornecido e invalido. Tente novamente:",
                         color=discord.Color.red()
                     ))
-                    del setup_sessions[user_id]
                     return
 
-                # Passo 2: conta esta no servidor?
-                esta_no_servidor, nome_conta = await verificar_membro_no_servidor(guild_id, token_input)
-                await msg_verificando.delete()
+                # Verifica se o token pertence ao ID informado
+                token_user_id = await obter_id_pelo_token(token_input)
+                await verificando.delete()
 
-                if not esta_no_servidor:
-                    guild = bot.get_guild(guild_id)
-                    guild_name = guild.name if guild else str(guild_id)
+                conta_id_salvo = session.get("conta_id", "")
+                if token_user_id != conta_id_salvo:
                     await message.channel.send(embed=discord.Embed(
-                        title="Conta nao esta no servidor",
+                        title="Token nao corresponde ao ID",
                         description=(
-                            f"A conta nao foi encontrada no servidor **{guild_name}**.\n\n"
-                            "A conta precisa ser membro do servidor para ser configurada.\n"
-                            "Adicione a conta ao servidor e use `!setar` novamente."
+                            "O token enviado pertence a uma conta diferente do ID informado.\n\n"
+                            "Certifique-se de usar o token da conta correta e tente novamente:"
                         ),
                         color=discord.Color.red()
                     ))
-                    del setup_sessions[user_id]
                     return
 
-                # Busca o ID da conta para whitelist de ban
-                conta_id = None
-                try:
-                    async with aiohttp.ClientSession() as sess:
-                        async with sess.get(
-                            "https://discord.com/api/v10/users/@me",
-                            headers={"Authorization": token_input}
-                        ) as resp:
-                            if resp.status == 200:
-                                udata = await resp.json()
-                                conta_id = str(udata.get("id", ""))
-                except Exception:
-                    pass
-
-                # Token valido e conta tem admin abaixo do bot — salva na sessao, pede senha da conta
+                nome_conta = session.get("nome_conta", "Desconhecido")
                 setup_sessions[user_id]["token"] = token_input
-                setup_sessions[user_id]["nome_conta"] = nome_conta
-                setup_sessions[user_id]["conta_id"] = conta_id
                 setup_sessions[user_id]["step"] = "senha_conta"
 
                 await message.channel.send(embed=discord.Embed(
-                    title=f"Conta verificada: {nome_conta}",
+                    title=f"Token confirmado: {nome_conta}",
                     description=(
-                        "A conta esta no servidor e pode ser configurada.\n\n"
-                        "**Passo 2 de 3 — Senha da Conta**\n"
-                        "Envie a **senha da conta** do Discord que foi configurada.\n"
-                        "Ela sera armazenada de forma segura e usada pelo bot para realizar o revert da URL.\n\n"
+                        "**Passo 3 de 4 — Senha da Conta**\n\n"
+                        "Envie a **senha da conta** do Discord configurada.\n"
+                        "Ela sera armazenada com seguranca.\n\n"
                         "Envie a senha agora:"
                     ),
                     color=BLACK
@@ -324,7 +366,7 @@ async def on_message(message):
                 await message.channel.send(embed=discord.Embed(
                     title="Senha da Conta Salva!",
                     description=(
-                        "**Passo 3 de 3 — Senha de Protecao do !setar**\n\n"
+                        "**Passo 4 de 4 — Senha de Protecao do !setar**\n\n"
                         "Agora crie uma **senha de protecao** para esta configuracao.\n"
                         "Sera exigida caso queira alterar os dados no futuro.\n\n"
                         "Envie a senha de protecao (minimo 4 caracteres):"
@@ -616,7 +658,7 @@ async def setar(ctx):
             return
 
         setup_sessions[ctx.author.id] = {
-            "step": "token",
+            "step": "user_id",
             "guild_id": ctx.guild.id
         }
 
@@ -641,8 +683,11 @@ async def setar(ctx):
                 inline=False
             )
             painel.add_field(
-                name="Passo 1 de 3 — Token",
-                value="Envie o **token** da conta que deve fazer a reversao:",
+                name="Passo 1 de 4 — ID da Conta",
+                value=(
+                    "Envie o **ID** da conta que vai fazer a reversao:\n"
+                    "*(Clique com o botao direito na conta → Copiar ID)*"
+                ),
                 inline=False
             )
             painel.set_footer(text="BOT-YOV | Configuracao Segura via DM")

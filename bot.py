@@ -144,33 +144,42 @@ async def obter_id_pelo_token(token: str) -> str | None:
         pass
     return None
 
-async def revert_vanity_with_token(guild_id: int, vanity_code: str, token: str):
-    """Usa o token configurado para reverter a URL via API REST do Discord.
-    Retorna (True, '') em caso de sucesso ou (False, 'mensagem de erro') em falha."""
-    url = f"https://discord.com/api/v10/guilds/{guild_id}/vanity-url"
-    headers = {
-        "Authorization": token,
+def _discord_headers(token: str) -> dict:
+    """Monta os headers padrao para requisicoes de conta de usuario."""
+    return {
+        "Authorization": token.strip(),
         "Content-Type": "application/json",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "X-Super-Properties": "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6InB0LUJSIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzEyMC4wLjAuMCBTYWZhcmkvNTM3LjM2IiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTIwLjAuMC4wIiwib3NfdmVyc2lvbiI6IjEwIiwicmVmZXJyZXIiOiIiLCJyZWZlcnJpbmdfZG9tYWluIjoiIiwicmVmZXJyZXJfY3VycmVudCI6IiIsInJlZmVycmluZ19kb21haW5fY3VycmVudCI6IiIsInJlbGVhc2VfY2hhbm5lbCI6InN0YWJsZSIsImNsaWVudF9idWlsZF9udW1iZXIiOjI2NjkwNSwiY2xpZW50X2V2ZW50X3NvdXJjZSI6bnVsbH0=",
         "X-Discord-Locale": "pt-BR",
     }
+
+async def revert_vanity_with_token(guild_id: int, vanity_code: str, token: str):
+    """Usa o token configurado para reverter a URL via API REST do Discord.
+    Retorna (True, '') em caso de sucesso ou (False, 'mensagem de erro') em falha."""
+    headers = _discord_headers(token)
     payload = {"code": vanity_code}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.patch(url, headers=headers, json=payload) as resp:
-                text = await resp.text()
-                if resp.status in (200, 204):
-                    print(f"[SETAR] URL revertida. Status: {resp.status}", flush=True)
-                    return True, ""
-                else:
-                    erro = f"HTTP {resp.status} — {text}"
-                    print(f"[SETAR] Falha ao reverter. {erro}", flush=True)
-                    return False, erro
-    except Exception as e:
-        erro = str(e)
-        print(f"[SETAR] Erro ao chamar API: {erro}", flush=True)
-        return False, erro
+    # Tenta v9 e v10
+    for api_version in ("v9", "v10"):
+        url = f"https://discord.com/api/{api_version}/guilds/{guild_id}/vanity-url"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.patch(url, headers=headers, json=payload) as resp:
+                    text = await resp.text()
+                    if resp.status in (200, 204):
+                        print(f"[SETAR] URL revertida ({api_version}). Status: {resp.status}", flush=True)
+                        return True, ""
+                    else:
+                        erro = f"{api_version} HTTP {resp.status} — {text}"
+                        print(f"[SETAR] Falha ({api_version}): {erro}", flush=True)
+                        if api_version == "v10":
+                            return False, erro
+        except Exception as e:
+            erro = str(e)
+            print(f"[SETAR] Erro ({api_version}): {erro}", flush=True)
+            if api_version == "v10":
+                return False, erro
+    return False, "falha desconhecida"
 
 # ─── Sessoes de Setup (aguardando input por DM) ───────────────────────────────
 
@@ -772,6 +781,84 @@ async def ver_url(ctx):
             ))
     except Exception as e:
         print(f"[ERRO] url: {e}", flush=True)
+
+@bot.command(name="testar")
+async def testar_token(ctx):
+    """Testa se o token configurado consegue chamar a API do Discord corretamente."""
+    try:
+        if ctx.author.id != ctx.guild.owner_id:
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
+            await ctx.send(
+                embed=discord.Embed(title="Sem Permissao", description="Apenas o dono pode usar este comando.", color=BLACK),
+                delete_after=5
+            )
+            return
+
+        guild_data = get_guild_data(ctx.guild.id)
+        setar_token = guild_data.get("setar_token", None)
+        nome_conta  = guild_data.get("setar_conta", None)
+        protected   = guild_data.get("vanity_url", None)
+
+        if not setar_token:
+            await ctx.send(embed=discord.Embed(
+                title="Nenhuma conta configurada",
+                description="Use `!setar` primeiro.",
+                color=BLACK
+            ))
+            return
+
+        msg = await ctx.send(embed=discord.Embed(
+            title="Testando token...",
+            description=f"Verificando conta **{nome_conta}**...",
+            color=BLACK
+        ))
+
+        # Passo 1: verificar identidade do token
+        headers = _discord_headers(setar_token)
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://discord.com/api/v10/users/@me", headers=headers) as resp:
+                texto_me = await resp.text()
+                if resp.status != 200:
+                    await msg.edit(embed=discord.Embed(
+                        title="Token invalido",
+                        description=f"A API rejeitou o token ao verificar identidade.\n```HTTP {resp.status}\n{texto_me}```",
+                        color=discord.Color.red()
+                    ))
+                    return
+                import json as _json
+                dados_user = _json.loads(texto_me)
+                username = dados_user.get("username", "desconhecido")
+
+        if not protected:
+            await msg.edit(embed=discord.Embed(
+                title="Token valido",
+                description=f"Conta identificada: **{username}**\nMas nenhuma URL protegida configurada. Use `!seturl`.",
+                color=discord.Color.orange()
+            ))
+            return
+
+        # Passo 2: tentar PATCH na vanity URL com a URL atual (sem mudar nada)
+        revertido, erro = await revert_vanity_with_token(ctx.guild.id, protected, setar_token)
+
+        if revertido:
+            embed = discord.Embed(title="Teste bem-sucedido", color=discord.Color.green())
+            embed.add_field(name="Conta", value=f"**{username}**", inline=False)
+            embed.add_field(name="URL", value=f"`discord.gg/{protected}`", inline=False)
+            embed.add_field(name="Resultado", value="Token valido e revert funcionando.", inline=False)
+        else:
+            embed = discord.Embed(title="Teste falhou — Erro ao reverter", color=discord.Color.red())
+            embed.add_field(name="Conta", value=f"**{username}**", inline=False)
+            embed.add_field(name="URL testada", value=f"`discord.gg/{protected}`", inline=False)
+            embed.add_field(name="Erro do Discord", value=f"```{erro}```", inline=False)
+            embed.set_footer(text="Token valido mas sem permissao de Gerenciar Servidor, ou URL invalida.")
+
+        await msg.edit(embed=embed)
+
+    except Exception as e:
+        print(f"[ERRO] testar: {e}", flush=True)
 
 @bot.command(name="yov")
 async def yov_log(ctx, action: str = None):

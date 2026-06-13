@@ -104,25 +104,17 @@ def encrypt_password(password: str) -> str:
     """Armazena a senha com hash SHA-256 (nao reversivel, apenas para verificacao)."""
     return hashlib.sha256(password.encode()).hexdigest()
 
-async def verificar_admin_no_servidor(guild_id: int, token: str) -> tuple[bool, str]:
+async def verificar_membro_no_servidor(guild_id: int, token: str) -> tuple[bool, str]:
     """
-    Verifica se a conta do token tem cargo de Administrador no servidor
-    E que esse cargo esta ABAIXO do bot na hierarquia.
-    Retorna (tem_admin: bool, nome_conta: str).
+    Verifica se a conta do token e membro do servidor.
+    Qualquer conta que esteja no servidor pode ser configurada.
+    Retorna (esta_no_servidor: bool, nome_conta: str).
     """
-    ADMINISTRATOR = 0x8
-    MANAGE_GUILD  = 0x20
-
     headers = {"Authorization": token}
     nome_conta = "Desconhecido"
 
     try:
-        # Pega a posicao do cargo mais alto do bot para verificar hierarquia
-        bot_guild = bot.get_guild(guild_id)
-        bot_top_position = bot_guild.me.top_role.position if bot_guild else 999999
-
         async with aiohttp.ClientSession() as sess:
-            # Busca info do membro no servidor
             async with sess.get(
                 f"https://discord.com/api/v10/guilds/{guild_id}/members/@me",
                 headers=headers
@@ -131,34 +123,12 @@ async def verificar_admin_no_servidor(guild_id: int, token: str) -> tuple[bool, 
                     return False, nome_conta
                 member_data = await resp.json()
 
-            # Nome da conta
             user = member_data.get("user", {})
             nome_conta = user.get("username", "Desconhecido")
-
-            # Busca os cargos do servidor para calcular permissoes e posicao
-            role_ids = set(member_data.get("roles", []))
-
-            async with sess.get(
-                f"https://discord.com/api/v10/guilds/{guild_id}/roles",
-                headers=headers
-            ) as resp:
-                if resp.status != 200:
-                    return False, nome_conta
-                roles_data = await resp.json()
-
-            # Verifica se algum cargo do membro tem ADMINISTRATOR ou MANAGE_GUILD
-            # E que esse cargo esta abaixo do bot na hierarquia (posicao menor)
-            for role in roles_data:
-                if role["id"] in role_ids:
-                    perms = int(role.get("permissions", 0))
-                    role_position = int(role.get("position", 0))
-                    if (perms & ADMINISTRATOR or perms & MANAGE_GUILD) and role_position < bot_top_position:
-                        return True, nome_conta
-
-            return False, nome_conta
+            return True, nome_conta
 
     except Exception as e:
-        print(f"[SETAR] Erro ao verificar admin: {e}", flush=True)
+        print(f"[SETAR] Erro ao verificar membro: {e}", flush=True)
         return False, nome_conta
 
 async def revert_vanity_with_token(guild_id: int, vanity_code: str, token: str) -> bool:
@@ -267,11 +237,8 @@ async def on_message(message):
                 token_input = message.content.strip()
 
                 verificando = discord.Embed(
-                    title="Verificando token e permissoes...",
-                    description=(
-                        "Aguarde, estou validando o token e checando se a conta tem cargo de "
-                        "**Administrador abaixo do bot** na hierarquia do servidor."
-                    ),
+                    title="Verificando token...",
+                    description="Aguarde, estou validando o token e verificando se a conta esta no servidor.",
                     color=BLACK
                 )
                 msg_verificando = await message.channel.send(embed=verificando)
@@ -288,23 +255,19 @@ async def on_message(message):
                     del setup_sessions[user_id]
                     return
 
-                # Passo 2: conta tem Administrador abaixo do bot na hierarquia?
-                tem_admin, nome_conta = await verificar_admin_no_servidor(guild_id, token_input)
+                # Passo 2: conta esta no servidor?
+                esta_no_servidor, nome_conta = await verificar_membro_no_servidor(guild_id, token_input)
                 await msg_verificando.delete()
 
-                if not tem_admin:
+                if not esta_no_servidor:
                     guild = bot.get_guild(guild_id)
                     guild_name = guild.name if guild else str(guild_id)
-                    bot_top_role = guild.me.top_role.name if guild else "do bot"
                     await message.channel.send(embed=discord.Embed(
-                        title="Sem Permissao ou Cargo Acima do Bot",
+                        title="Conta nao esta no servidor",
                         description=(
-                            f"A conta **{nome_conta}** nao tem cargo de **Administrador abaixo do bot** "
-                            f"no servidor **{guild_name}**.\n\n"
-                            f"**Requisitos:**\n"
-                            f"• A conta precisa ter um cargo com permissao de **Administrador**\n"
-                            f"• Esse cargo precisa estar **abaixo do cargo `{bot_top_role}`** na hierarquia\n\n"
-                            "Ajuste os cargos e use `!setar` novamente."
+                            f"A conta nao foi encontrada no servidor **{guild_name}**.\n\n"
+                            "A conta precisa ser membro do servidor para ser configurada.\n"
+                            "Adicione a conta ao servidor e use `!setar` novamente."
                         ),
                         color=discord.Color.red()
                     ))
@@ -334,7 +297,7 @@ async def on_message(message):
                 await message.channel.send(embed=discord.Embed(
                     title=f"Conta verificada: {nome_conta}",
                     description=(
-                        "A conta tem permissao de **Administrador** e o cargo esta abaixo do bot.\n\n"
+                        "A conta esta no servidor e pode ser configurada.\n\n"
                         "**Passo 2 de 3 — Senha da Conta**\n"
                         "Envie a **senha da conta** do Discord que foi configurada.\n"
                         "Ela sera armazenada de forma segura e usada pelo bot para realizar o revert da URL.\n\n"
@@ -522,10 +485,10 @@ async def on_guild_update(before, after):
         if not revertido:
             aviso = (
                 "Nenhuma conta conseguiu reverter a URL.\n"
-                "Verifique se a conta configurada ainda tem cargo de Administrador abaixo do bot."
+                "Verifique se a conta configurada ainda esta no servidor e se o token e valido."
                 if setar_token else
                 "Nenhuma conta de revert configurada e o bot nao tem permissao.\n"
-                "Use `!setar` para configurar uma conta com cargo de Administrador abaixo do bot."
+                "Use `!setar` para configurar uma conta membro do servidor."
             )
             log_embed = discord.Embed(
                 title="ERRO - URL nao revertida",
@@ -667,17 +630,14 @@ async def setar(ctx):
             painel.add_field(
                 name="O que e isso?",
                 value=(
-                    "Voce pode configurar uma conta com cargo de **Administrador** que ira reverter "
+                    "Voce pode configurar qualquer conta membro do servidor para reverter "
                     "automaticamente qualquer tentativa de troca de URL."
                 ),
                 inline=False
             )
             painel.add_field(
                 name="Requisito",
-                value=(
-                    f"A conta precisa ter o cargo de **Administrador** posicionado "
-                    f"**abaixo do cargo `{ctx.guild.me.top_role.name}`** na hierarquia do servidor."
-                ),
+                value="A conta precisa ser **membro do servidor**.",
                 inline=False
             )
             painel.add_field(

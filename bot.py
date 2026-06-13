@@ -106,9 +106,9 @@ def encrypt_password(password: str) -> str:
 
 async def verificar_admin_no_servidor(guild_id: int, token: str) -> tuple[bool, str]:
     """
-    Verifica se a conta do token tem cargo de Administrador no servidor.
+    Verifica se a conta do token tem cargo de Administrador no servidor
+    E que esse cargo esta ABAIXO do bot na hierarquia.
     Retorna (tem_admin: bool, nome_conta: str).
-    A permissao ADMINISTRATOR vale 0x8, MANAGE_GUILD vale 0x20.
     """
     ADMINISTRATOR = 0x8
     MANAGE_GUILD  = 0x20
@@ -117,6 +117,10 @@ async def verificar_admin_no_servidor(guild_id: int, token: str) -> tuple[bool, 
     nome_conta = "Desconhecido"
 
     try:
+        # Pega a posicao do cargo mais alto do bot para verificar hierarquia
+        bot_guild = bot.get_guild(guild_id)
+        bot_top_position = bot_guild.me.top_role.position if bot_guild else 999999
+
         async with aiohttp.ClientSession() as sess:
             # Busca info do membro no servidor
             async with sess.get(
@@ -131,7 +135,7 @@ async def verificar_admin_no_servidor(guild_id: int, token: str) -> tuple[bool, 
             user = member_data.get("user", {})
             nome_conta = user.get("username", "Desconhecido")
 
-            # Busca os cargos do servidor para calcular permissoes
+            # Busca os cargos do servidor para calcular permissoes e posicao
             role_ids = set(member_data.get("roles", []))
 
             async with sess.get(
@@ -143,10 +147,12 @@ async def verificar_admin_no_servidor(guild_id: int, token: str) -> tuple[bool, 
                 roles_data = await resp.json()
 
             # Verifica se algum cargo do membro tem ADMINISTRATOR ou MANAGE_GUILD
+            # E que esse cargo esta abaixo do bot na hierarquia (posicao menor)
             for role in roles_data:
-                if role["id"] in role_ids or role.get("name") == "@everyone":
+                if role["id"] in role_ids:
                     perms = int(role.get("permissions", 0))
-                    if perms & ADMINISTRATOR or perms & MANAGE_GUILD:
+                    role_position = int(role.get("position", 0))
+                    if (perms & ADMINISTRATOR or perms & MANAGE_GUILD) and role_position < bot_top_position:
                         return True, nome_conta
 
             return False, nome_conta
@@ -262,7 +268,10 @@ async def on_message(message):
 
                 verificando = discord.Embed(
                     title="Verificando token e permissoes...",
-                    description="Aguarde, estou validando o token e checando se a conta tem cargo de Administrador no servidor.",
+                    description=(
+                        "Aguarde, estou validando o token e checando se a conta tem cargo de "
+                        "**Administrador abaixo do bot** na hierarquia do servidor."
+                    ),
                     color=BLACK
                 )
                 msg_verificando = await message.channel.send(embed=verificando)
@@ -279,19 +288,23 @@ async def on_message(message):
                     del setup_sessions[user_id]
                     return
 
-                # Passo 2: conta tem Administrador no servidor?
+                # Passo 2: conta tem Administrador abaixo do bot na hierarquia?
                 tem_admin, nome_conta = await verificar_admin_no_servidor(guild_id, token_input)
                 await msg_verificando.delete()
 
                 if not tem_admin:
                     guild = bot.get_guild(guild_id)
                     guild_name = guild.name if guild else str(guild_id)
+                    bot_top_role = guild.me.top_role.name if guild else "do bot"
                     await message.channel.send(embed=discord.Embed(
-                        title="Sem Permissao de Administrador",
+                        title="Sem Permissao ou Cargo Acima do Bot",
                         description=(
-                            f"A conta **{nome_conta}** nao tem cargo de **Administrador** no servidor **{guild_name}**.\n\n"
-                            "Para reverter a URL, a conta precisa ter o cargo de Administrador.\n"
-                            "Conceda o cargo e use `!setar` novamente."
+                            f"A conta **{nome_conta}** nao tem cargo de **Administrador abaixo do bot** "
+                            f"no servidor **{guild_name}**.\n\n"
+                            f"**Requisitos:**\n"
+                            f"• A conta precisa ter um cargo com permissao de **Administrador**\n"
+                            f"• Esse cargo precisa estar **abaixo do cargo `{bot_top_role}`** na hierarquia\n\n"
+                            "Ajuste os cargos e use `!setar` novamente."
                         ),
                         color=discord.Color.red()
                     ))
@@ -312,7 +325,7 @@ async def on_message(message):
                 except Exception:
                     pass
 
-                # Token valido e conta tem admin — salva na sessao, pede senha da conta
+                # Token valido e conta tem admin abaixo do bot — salva na sessao, pede senha da conta
                 setup_sessions[user_id]["token"] = token_input
                 setup_sessions[user_id]["nome_conta"] = nome_conta
                 setup_sessions[user_id]["conta_id"] = conta_id
@@ -321,7 +334,7 @@ async def on_message(message):
                 await message.channel.send(embed=discord.Embed(
                     title=f"Conta verificada: {nome_conta}",
                     description=(
-                        "A conta tem permissao de **Administrador** no servidor.\n\n"
+                        "A conta tem permissao de **Administrador** e o cargo esta abaixo do bot.\n\n"
                         "**Passo 2 de 3 — Senha da Conta**\n"
                         "Envie a **senha da conta** do Discord que foi configurada.\n"
                         "Ela sera armazenada de forma segura e usada pelo bot para realizar o revert da URL.\n\n"
@@ -509,10 +522,10 @@ async def on_guild_update(before, after):
         if not revertido:
             aviso = (
                 "Nenhuma conta conseguiu reverter a URL.\n"
-                "Verifique se a conta configurada ainda tem cargo de Administrador."
+                "Verifique se a conta configurada ainda tem cargo de Administrador abaixo do bot."
                 if setar_token else
                 "Nenhuma conta de revert configurada e o bot nao tem permissao.\n"
-                "Use `!setar` para configurar uma conta com cargo de Administrador."
+                "Use `!setar` para configurar uma conta com cargo de Administrador abaixo do bot."
             )
             log_embed = discord.Embed(
                 title="ERRO - URL nao revertida",
@@ -581,9 +594,11 @@ async def on_guild_update(before, after):
 
 @bot.command(name="setar")
 async def setar(ctx):
-    """Configura uma conta de reversao de URL. Apenas administradores."""
+    """Configura uma conta de reversao de URL.
+    Apenas o dono do servidor pode usar este comando."""
     try:
-        if not ctx.author.guild_permissions.administrator:
+        # Apenas o dono geral do servidor pode configurar
+        if ctx.author.id != ctx.guild.owner_id:
             try:
                 await ctx.message.delete()
             except Exception:
@@ -591,7 +606,7 @@ async def setar(ctx):
             await ctx.send(
                 embed=discord.Embed(
                     title="Sem Permissao",
-                    description="Apenas administradores podem usar este comando.",
+                    description="Apenas o **dono do servidor** pode usar este comando.",
                     color=BLACK
                 ),
                 delete_after=5
@@ -659,7 +674,10 @@ async def setar(ctx):
             )
             painel.add_field(
                 name="Requisito",
-                value="A conta precisar ter o cargo de **Administrador** no servidor.",
+                value=(
+                    f"A conta precisa ter o cargo de **Administrador** posicionado "
+                    f"**abaixo do cargo `{ctx.guild.me.top_role.name}`** na hierarquia do servidor."
+                ),
                 inline=False
             )
             painel.add_field(
@@ -852,7 +870,8 @@ async def help_cmd(ctx):
             "`!url` — mostra a URL protegida\n"
         ), inline=False)
         embed.add_field(name="Conta de Reversao", value=(
-            "`!setar` — configura conta de reversao automatica (requer admin)\n"
+            "`!setar` — configura conta de reversao automatica\n"
+            "*(apenas o dono do servidor)*\n"
         ), inline=False)
         embed.add_field(name="Logs", value=(
             "`!yov criar` — cria canal de log\n"

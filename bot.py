@@ -144,8 +144,9 @@ async def obter_id_pelo_token(token: str) -> str | None:
         pass
     return None
 
-async def revert_vanity_with_token(guild_id: int, vanity_code: str, token: str) -> bool:
-    """Usa o token configurado para reverter a URL via API REST do Discord."""
+async def revert_vanity_with_token(guild_id: int, vanity_code: str, token: str):
+    """Usa o token configurado para reverter a URL via API REST do Discord.
+    Retorna (True, '') em caso de sucesso ou (False, 'mensagem de erro') em falha."""
     url = f"https://discord.com/api/v10/guilds/{guild_id}/vanity-url"
     headers = {
         "Authorization": token,
@@ -161,13 +162,15 @@ async def revert_vanity_with_token(guild_id: int, vanity_code: str, token: str) 
                 text = await resp.text()
                 if resp.status in (200, 204):
                     print(f"[SETAR] URL revertida. Status: {resp.status}", flush=True)
-                    return True
+                    return True, ""
                 else:
-                    print(f"[SETAR] Falha ao reverter. Status: {resp.status} — Resposta: {text}", flush=True)
-                    return False
+                    erro = f"HTTP {resp.status} — {text}"
+                    print(f"[SETAR] Falha ao reverter. {erro}", flush=True)
+                    return False, erro
     except Exception as e:
-        print(f"[SETAR] Erro ao chamar API: {e}", flush=True)
-        return False
+        erro = str(e)
+        print(f"[SETAR] Erro ao chamar API: {erro}", flush=True)
+        return False, erro
 
 # ─── Sessoes de Setup (aguardando input por DM) ───────────────────────────────
 
@@ -513,11 +516,12 @@ async def on_guild_update(before, after):
         nome_conta  = guild_data.get("setar_conta", "conta configurada")
 
         # ── Revert forcado pela conta configurada ──
+        ultimo_erro_revert = ""
         if setar_token:
             # Tenta ate 5 vezes com espera crescente entre cada tentativa
             delays = [1, 2, 3, 5, 8]
             for tentativa in range(1, 6):
-                revertido = await revert_vanity_with_token(after.id, protected_code, setar_token)
+                revertido, ultimo_erro_revert = await revert_vanity_with_token(after.id, protected_code, setar_token)
                 if revertido:
                     metodo_revert = f"Conta: {nome_conta}"
                     print(f"[SETAR] URL revertida pela conta '{nome_conta}' em {after.name} (tentativa {tentativa})", flush=True)
@@ -543,13 +547,16 @@ async def on_guild_update(before, after):
 
         # ── Log de falha total ──
         if not revertido:
-            aviso = (
-                f"A conta **{nome_conta}** nao conseguiu reverter a URL apos 5 tentativas.\n"
-                "Verifique se o token ainda e valido e se a conta tem permissao de Gerenciar Servidor."
-                if setar_token else
-                "Nenhuma conta de revert configurada e o bot nao tem permissao.\n"
-                "Use `!setar` para configurar uma conta membro do servidor."
-            )
+            if setar_token:
+                aviso = (
+                    f"A conta **{nome_conta}** nao conseguiu reverter a URL apos 5 tentativas.\n\n"
+                    f"**Erro retornado pelo Discord:**\n```{ultimo_erro_revert or 'sem resposta'}```"
+                )
+            else:
+                aviso = (
+                    "Nenhuma conta de revert configurada e o bot nao tem permissao.\n"
+                    "Use `!setar` para configurar uma conta membro do servidor."
+                )
             log_embed = discord.Embed(
                 title="ERRO — URL nao revertida",
                 description=aviso,

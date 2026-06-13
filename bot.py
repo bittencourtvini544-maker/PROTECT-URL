@@ -149,21 +149,24 @@ async def revert_vanity_with_token(guild_id: int, vanity_code: str, token: str) 
     url = f"https://discord.com/api/v10/guilds/{guild_id}/vanity-url"
     headers = {
         "Authorization": token,
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "X-Super-Properties": "eyJvcyI6IldpbmRvd3MiLCJicm93c2VyIjoiQ2hyb21lIiwiZGV2aWNlIjoiIiwic3lzdGVtX2xvY2FsZSI6InB0LUJSIiwiYnJvd3Nlcl91c2VyX2FnZW50IjoiTW96aWxsYS81LjAgKFdpbmRvd3MgTlQgMTAuMDsgV2luNjQ7IHg2NCkgQXBwbGVXZWJLaXQvNTM3LjM2IChLSFRNTCwgbGlrZSBHZWNrbykgQ2hyb21lLzEyMC4wLjAuMCBTYWZhcmkvNTM3LjM2IiwiYnJvd3Nlcl92ZXJzaW9uIjoiMTIwLjAuMC4wIiwib3NfdmVyc2lvbiI6IjEwIiwicmVmZXJyZXIiOiIiLCJyZWZlcnJpbmdfZG9tYWluIjoiIiwicmVmZXJyZXJfY3VycmVudCI6IiIsInJlZmVycmluZ19kb21haW5fY3VycmVudCI6IiIsInJlbGVhc2VfY2hhbm5lbCI6InN0YWJsZSIsImNsaWVudF9idWlsZF9udW1iZXIiOjI2NjkwNSwiY2xpZW50X2V2ZW50X3NvdXJjZSI6bnVsbH0=",
+        "X-Discord-Locale": "pt-BR",
     }
     payload = {"code": vanity_code}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.patch(url, headers=headers, json=payload) as resp:
+                text = await resp.text()
                 if resp.status in (200, 204):
-                    print(f"[SETAR] URL revertida com conta configurada. Status: {resp.status}", flush=True)
+                    print(f"[SETAR] URL revertida. Status: {resp.status}", flush=True)
                     return True
                 else:
-                    text = await resp.text()
-                    print(f"[SETAR] Falha ao reverter com conta configurada. Status: {resp.status} — {text}", flush=True)
+                    print(f"[SETAR] Falha ao reverter. Status: {resp.status} — Resposta: {text}", flush=True)
                     return False
     except Exception as e:
-        print(f"[SETAR] Erro ao usar token configurado: {e}", flush=True)
+        print(f"[SETAR] Erro ao chamar API: {e}", flush=True)
         return False
 
 # ─── Sessoes de Setup (aguardando input por DM) ───────────────────────────────
@@ -511,19 +514,20 @@ async def on_guild_update(before, after):
 
         # ── Revert forcado pela conta configurada ──
         if setar_token:
-            # Tenta ate 3 vezes para garantir o revert
-            for tentativa in range(1, 4):
+            # Tenta ate 5 vezes com espera crescente entre cada tentativa
+            delays = [1, 2, 3, 5, 8]
+            for tentativa in range(1, 6):
                 revertido = await revert_vanity_with_token(after.id, protected_code, setar_token)
                 if revertido:
                     metodo_revert = f"Conta: {nome_conta}"
                     print(f"[SETAR] URL revertida pela conta '{nome_conta}' em {after.name} (tentativa {tentativa})", flush=True)
                     break
                 else:
-                    print(f"[SETAR] Tentativa {tentativa} de revert falhou em {after.name}", flush=True)
-                    await asyncio.sleep(1)
+                    print(f"[SETAR] Tentativa {tentativa} falhou em {after.name}. Aguardando {delays[tentativa-1]}s...", flush=True)
+                    await asyncio.sleep(delays[tentativa - 1])
 
             if not revertido:
-                print(f"[SETAR] Todas as tentativas falharam em {after.name}. Token invalido ou sem permissao.", flush=True)
+                print(f"[SETAR] Todas as tentativas falharam em {after.name}.", flush=True)
 
         else:
             # Sem conta configurada: tenta com o proprio bot como unico fallback
@@ -540,7 +544,7 @@ async def on_guild_update(before, after):
         # ── Log de falha total ──
         if not revertido:
             aviso = (
-                f"A conta **{nome_conta}** nao conseguiu reverter a URL apos 3 tentativas.\n"
+                f"A conta **{nome_conta}** nao conseguiu reverter a URL apos 5 tentativas.\n"
                 "Verifique se o token ainda e valido e se a conta tem permissao de Gerenciar Servidor."
                 if setar_token else
                 "Nenhuma conta de revert configurada e o bot nao tem permissao.\n"

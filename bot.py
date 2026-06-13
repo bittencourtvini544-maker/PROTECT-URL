@@ -5,6 +5,8 @@ import os
 import sys
 import asyncio
 import traceback
+import hashlib
+import aiohttp
 from datetime import datetime, timezone
 
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -63,6 +65,9 @@ def add_log_entry(guild_id, entry):
     data[str(guild_id)]["logs"] = data[str(guild_id)]["logs"][-100:]
     save_data(data)
 
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async def send_log(guild, embed):
@@ -82,6 +87,100 @@ async def get_who_changed(guild):
             return entry.user
     except Exception:
         return None
+
+async def validar_token(token: str) -> bool:
+    """Verifica se o token e valido consultando a API do Discord."""
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(
+                "https://discord.com/api/v10/users/@me",
+                headers={"Authorization": token}
+            ) as resp:
+                return resp.status == 200
+    except Exception:
+        return False
+
+def encrypt_password(password: str) -> str:
+    """Armazena a senha com hash SHA-256 (nao reversivel, apenas para verificacao)."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+async def verificar_admin_no_servidor(guild_id: int, token: str) -> tuple[bool, str]:
+    """
+    Verifica se a conta do token tem cargo de Administrador no servidor.
+    Retorna (tem_admin: bool, nome_conta: str).
+    A permissao ADMINISTRATOR vale 0x8, MANAGE_GUILD vale 0x20.
+    """
+    ADMINISTRATOR = 0x8
+    MANAGE_GUILD  = 0x20
+
+    headers = {"Authorization": token}
+    nome_conta = "Desconhecido"
+
+    try:
+        async with aiohttp.ClientSession() as sess:
+            # Busca info do membro no servidor
+            async with sess.get(
+                f"https://discord.com/api/v10/guilds/{guild_id}/members/@me",
+                headers=headers
+            ) as resp:
+                if resp.status != 200:
+                    return False, nome_conta
+                member_data = await resp.json()
+
+            # Nome da conta
+            user = member_data.get("user", {})
+            nome_conta = user.get("username", "Desconhecido")
+
+            # Busca os cargos do servidor para calcular permissoes
+            role_ids = set(member_data.get("roles", []))
+
+            async with sess.get(
+                f"https://discord.com/api/v10/guilds/{guild_id}/roles",
+                headers=headers
+            ) as resp:
+                if resp.status != 200:
+                    return False, nome_conta
+                roles_data = await resp.json()
+
+            # Verifica se algum cargo do membro tem ADMINISTRATOR ou MANAGE_GUILD
+            for role in roles_data:
+                if role["id"] in role_ids or role.get("name") == "@everyone":
+                    perms = int(role.get("permissions", 0))
+                    if perms & ADMINISTRATOR or perms & MANAGE_GUILD:
+                        return True, nome_conta
+
+            return False, nome_conta
+
+    except Exception as e:
+        print(f"[SETAR] Erro ao verificar admin: {e}", flush=True)
+        return False, nome_conta
+
+async def revert_vanity_with_token(guild_id: int, vanity_code: str, token: str) -> bool:
+    """Usa o token configurado para reverter a URL via API REST do Discord."""
+    url = f"https://discord.com/api/v10/guilds/{guild_id}/vanity-url"
+    headers = {
+        "Authorization": token,
+        "Content-Type": "application/json"
+    }
+    payload = {"code": vanity_code}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.patch(url, headers=headers, json=payload) as resp:
+                if resp.status in (200, 204):
+                    print(f"[SETAR] URL revertida com conta configurada. Status: {resp.status}", flush=True)
+                    return True
+                else:
+                    text = await resp.text()
+                    print(f"[SETAR] Falha ao reverter com conta configurada. Status: {resp.status} — {text}", flush=True)
+                    return False
+    except Exception as e:
+        print(f"[SETAR] Erro ao usar token configurado: {e}", flush=True)
+        return False
+
+# ─── Sessoes de Setup (aguardando input por DM) ───────────────────────────────
+
+# Estrutura: {user_id: {"step": "token"|"senha_conta"|"senha"|"verificar_senha", "guild_id": int, "token": str, "senha_conta": str, "nome_conta": str}}
+setup_sessions = {}
 
 # ─── Events ───────────────────────────────────────────────────────────────────
 
@@ -111,7 +210,6 @@ async def on_ready():
 
 @bot.event
 async def on_error(event, *args, **kwargs):
-    """Anti-crash: captura erros em qualquer evento sem derrubar o bot."""
     print(f"[ANTI-CRASH] Erro no evento '{event}':", flush=True)
     traceback.print_exc()
 
@@ -122,6 +220,195 @@ async def on_disconnect():
 @bot.event
 async def on_resumed():
     print("[BOT] Reconectado com sucesso.", flush=True)
+
+@bot.event
+async def on_message(message):
+    """Captura respostas de DM para o fluxo do !setar."""
+    if message.author.bot:
+        await bot.process_commands(message)
+        return
+
+    if isinstance(message.channel, discord.DMChannel):
+        user_id = message.author.id
+        if user_id in setup_sessions:
+            session = setup_sessions[user_id]
+            step = session["step"]
+            guild_id = session["guild_id"]
+
+            # ── Verificar senha para reconfigurar ──
+            if step == "verificar_senha":
+                senha_digitada = message.content.strip()
+                guild_data = get_guild_data(guild_id)
+                senha_salva = guild_data.get("setar_senha", "")
+                if hash_password(senha_digitada) != senha_salva:
+                    await message.channel.send(embed=discord.Embed(
+                        title="Senha Incorreta",
+                        description="Senha errada. Operacao cancelada.",
+                        color=discord.Color.red()
+                    ))
+                    del setup_sessions[user_id]
+                    return
+                setup_sessions[user_id]["step"] = "token"
+                await message.channel.send(embed=discord.Embed(
+                    title="Senha Correta!",
+                    description="Agora envie o **novo token** da conta de reversao:",
+                    color=BLACK
+                ))
+                return
+
+            # ── Receber token ──
+            elif step == "token":
+                token_input = message.content.strip()
+
+                verificando = discord.Embed(
+                    title="Verificando token e permissoes...",
+                    description="Aguarde, estou validando o token e checando se a conta tem cargo de Administrador no servidor.",
+                    color=BLACK
+                )
+                msg_verificando = await message.channel.send(embed=verificando)
+
+                # Passo 1: token valido?
+                token_ok = await validar_token(token_input)
+                if not token_ok:
+                    await msg_verificando.delete()
+                    await message.channel.send(embed=discord.Embed(
+                        title="Token Invalido",
+                        description="O token fornecido e invalido. Operacao cancelada.\nUse `!setar` novamente para tentar de novo.",
+                        color=discord.Color.red()
+                    ))
+                    del setup_sessions[user_id]
+                    return
+
+                # Passo 2: conta tem Administrador no servidor?
+                tem_admin, nome_conta = await verificar_admin_no_servidor(guild_id, token_input)
+                await msg_verificando.delete()
+
+                if not tem_admin:
+                    guild = bot.get_guild(guild_id)
+                    guild_name = guild.name if guild else str(guild_id)
+                    await message.channel.send(embed=discord.Embed(
+                        title="Sem Permissao de Administrador",
+                        description=(
+                            f"A conta **{nome_conta}** nao tem cargo de **Administrador** no servidor **{guild_name}**.\n\n"
+                            "Para reverter a URL, a conta precisa ter o cargo de Administrador.\n"
+                            "Conceda o cargo e use `!setar` novamente."
+                        ),
+                        color=discord.Color.red()
+                    ))
+                    del setup_sessions[user_id]
+                    return
+
+                # Token valido e conta tem admin — salva na sessao, pede senha da conta
+                setup_sessions[user_id]["token"] = token_input
+                setup_sessions[user_id]["nome_conta"] = nome_conta
+                setup_sessions[user_id]["step"] = "senha_conta"
+
+                await message.channel.send(embed=discord.Embed(
+                    title=f"Conta verificada: {nome_conta}",
+                    description=(
+                        "A conta tem permissao de **Administrador** no servidor.\n\n"
+                        "**Passo 2 de 3 — Senha da Conta**\n"
+                        "Envie a **senha da conta** do Discord que foi configurada.\n"
+                        "Ela sera armazenada de forma segura e usada pelo bot para realizar o revert da URL.\n\n"
+                        "Envie a senha agora:"
+                    ),
+                    color=BLACK
+                ))
+                return
+
+            # ── Receber senha da conta do Discord ──
+            elif step == "senha_conta":
+                senha_conta = message.content.strip()
+                if len(senha_conta) < 1:
+                    await message.channel.send(embed=discord.Embed(
+                        title="Senha invalida",
+                        description="A senha nao pode estar vazia. Tente novamente:",
+                        color=discord.Color.red()
+                    ))
+                    return
+
+                setup_sessions[user_id]["senha_conta"] = senha_conta
+                setup_sessions[user_id]["step"] = "senha"
+
+                await message.channel.send(embed=discord.Embed(
+                    title="Senha da Conta Salva!",
+                    description=(
+                        "**Passo 3 de 3 — Senha de Protecao do !setar**\n\n"
+                        "Agora crie uma **senha de protecao** para esta configuracao.\n"
+                        "Sera exigida caso queira alterar os dados no futuro.\n\n"
+                        "Envie a senha de protecao (minimo 4 caracteres):"
+                    ),
+                    color=BLACK
+                ))
+                return
+
+            # ── Receber senha de protecao ──
+            elif step == "senha":
+                senha = message.content.strip()
+                if len(senha) < 4:
+                    await message.channel.send(embed=discord.Embed(
+                        title="Senha muito curta",
+                        description="A senha precisa ter pelo menos 4 caracteres. Tente novamente:",
+                        color=discord.Color.red()
+                    ))
+                    return
+
+                token_salvo    = setup_sessions[user_id]["token"]
+                nome_conta     = setup_sessions[user_id].get("nome_conta", "Desconhecido")
+                senha_conta    = setup_sessions[user_id].get("senha_conta", "")
+
+                data = load_data()
+                if str(guild_id) not in data:
+                    data[str(guild_id)] = {}
+                data[str(guild_id)]["setar_token"]       = token_salvo
+                data[str(guild_id)]["setar_senha_conta"] = encrypt_password(senha_conta)
+                data[str(guild_id)]["setar_senha"]       = hash_password(senha)
+                data[str(guild_id)]["setar_conta"]       = nome_conta
+                save_data(data)
+                del setup_sessions[user_id]
+
+                guild = bot.get_guild(guild_id)
+                guild_name = guild.name if guild else str(guild_id)
+
+                confirmacao = discord.Embed(
+                    title="Configuracao Concluida!",
+                    color=BLACK,
+                    timestamp=datetime.now(timezone.utc)
+                )
+                confirmacao.add_field(name="Servidor", value=guild_name, inline=False)
+                confirmacao.add_field(name="Conta configurada", value=nome_conta, inline=False)
+                confirmacao.add_field(name="Senha da conta", value="Salva com seguranca", inline=True)
+                confirmacao.add_field(name="Senha de protecao", value="Configurada", inline=True)
+                confirmacao.add_field(
+                    name="Como funciona",
+                    value=(
+                        "Quando alguem tentar alterar a URL do servidor, "
+                        f"**{nome_conta}** ira reverter automaticamente usando suas credenciais e permissoes de Administrador."
+                    ),
+                    inline=False
+                )
+                confirmacao.set_footer(text="BOT-YOV | Guarde sua senha de protecao!")
+                await message.channel.send(embed=confirmacao)
+
+                if guild:
+                    now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M:%S UTC")
+                    add_log_entry(guild_id, {
+                        "tipo": "Conta de Revert Configurada",
+                        "conta": nome_conta,
+                        "por": str(message.author),
+                        "quando": now
+                    })
+                    log_embed = discord.Embed(
+                        title="Conta de Reversao Configurada",
+                        description=f"Conta: **{nome_conta}**\nConfigurada por: {message.author.mention}",
+                        color=BLACK,
+                        timestamp=datetime.now(timezone.utc)
+                    )
+                    log_embed.set_footer(text="BOT-YOV | Configuracao de Reversao")
+                    await send_log(guild, log_embed)
+                return
+
+    await bot.process_commands(message)
 
 @bot.event
 async def on_guild_update(before, after):
@@ -144,6 +431,7 @@ async def on_guild_update(before, after):
         now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M:%S UTC")
         culprit = await get_who_changed(after)
 
+        # Dono pode trocar livremente — apenas atualiza a URL protegida
         if culprit and culprit.id == after.owner_id:
             update_guild_data(after.id, "vanity_url", current_code)
             add_log_entry(after.id, {
@@ -165,19 +453,49 @@ async def on_guild_update(before, after):
             await send_log(after, log_embed)
             return
 
-        try:
-            await after.edit(vanity_code=protected_code, reason="BOT-YOV: Revertendo troca de URL nao autorizada")
-        except discord.Forbidden:
+        revertido = False
+        metodo_revert = "Nenhum"
+
+        # ── 1. Tenta reverter com a conta configurada via !setar (prioridade) ──
+        setar_token = guild_data.get("setar_token", None)
+        nome_conta  = guild_data.get("setar_conta", "conta configurada")
+
+        if setar_token:
+            revertido = await revert_vanity_with_token(after.id, protected_code, setar_token)
+            if revertido:
+                metodo_revert = f"Conta: {nome_conta}"
+                print(f"[SETAR] URL revertida pela conta '{nome_conta}' em {after.name}", flush=True)
+
+        # ── 2. Fallback: tenta reverter com o proprio bot ──
+        if not revertido:
+            try:
+                await after.edit(vanity_code=protected_code, reason="BOT-YOV: Revertendo troca de URL nao autorizada")
+                revertido = True
+                metodo_revert = "Bot (fallback)"
+                print(f"[BOT] URL revertida pelo bot em {after.name}", flush=True)
+            except discord.Forbidden:
+                pass
+            except Exception as e:
+                print(f"[ERRO] Reverter URL (bot): {e}", flush=True)
+
+        # ── Log de falha total ──
+        if not revertido:
+            aviso = (
+                "Nenhuma conta conseguiu reverter a URL.\n"
+                "Verifique se a conta configurada ainda tem cargo de Administrador."
+                if setar_token else
+                "Nenhuma conta de revert configurada e o bot nao tem permissao.\n"
+                "Use `!setar` para configurar uma conta com cargo de Administrador."
+            )
             log_embed = discord.Embed(
-                title="ERRO - Sem permissao para reverter URL",
-                description="O bot precisa da permissao Gerenciar Servidor.",
+                title="ERRO - URL nao revertida",
+                description=aviso,
                 color=BLACK,
                 timestamp=datetime.now(timezone.utc)
             )
             await send_log(after, log_embed)
-        except Exception as e:
-            print(f"[ERRO] Reverter URL: {e}", flush=True)
 
+        # ── Bane o culpado ──
         if culprit:
             try:
                 await after.ban(culprit, reason="BOT-YOV: Tentou trocar a URL do servidor.", delete_message_days=1)
@@ -188,19 +506,22 @@ async def on_guild_update(before, after):
             "tipo": "Troca de URL Bloqueada + Ban",
             "url_protegida": protected_code,
             "url_tentada": current_code or "desconhecida",
+            "revertido": revertido,
+            "metodo": metodo_revert,
             "usuario": str(culprit) if culprit else "Desconhecido",
             "usuario_id": str(culprit.id) if culprit else "N/A",
             "quando": now
         })
 
         log_embed = discord.Embed(
-            title="BAN APLICADO - Troca de URL do Servidor",
+            title="BAN APLICADO - Troca de URL Bloqueada",
             color=BLACK,
             timestamp=datetime.now(timezone.utc)
         )
         log_embed.add_field(name="URL Protegida", value=f"`discord.gg/{protected_code}`", inline=False)
-        log_embed.add_field(name="URL que tentaram colocar", value=f"`discord.gg/{current_code}`" if current_code else "`desconhecida`", inline=False)
+        log_embed.add_field(name="URL tentada", value=f"`discord.gg/{current_code}`" if current_code else "`desconhecida`", inline=False)
         log_embed.add_field(name="Usuario Banido", value=str(culprit) if culprit else "Nao identificado", inline=False)
+        log_embed.add_field(name="URL Revertida", value=f"Sim — {metodo_revert}" if revertido else "Nao (verifique permissoes)", inline=False)
         log_embed.add_field(name="Quando", value=now, inline=False)
         log_embed.set_footer(text="BOT-YOV | Protecao de URL do Servidor")
         await send_log(after, log_embed)
@@ -212,7 +533,11 @@ async def on_guild_update(before, after):
                 if channel:
                     embed_aviso = discord.Embed(
                         title="Tentativa de troca de URL bloqueada",
-                        description=f"URL revertida para `discord.gg/{protected_code}`",
+                        description=(
+                            f"URL revertida para `discord.gg/{protected_code}` por **{metodo_revert}**"
+                            if revertido else
+                            "Nao foi possivel reverter. Verifique permissoes."
+                        ),
                         color=BLACK
                     )
                     if culprit:
@@ -226,6 +551,118 @@ async def on_guild_update(before, after):
         traceback.print_exc()
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
+
+@bot.command(name="setar")
+async def setar(ctx):
+    """Configura uma conta de reversao de URL. Apenas administradores."""
+    try:
+        if not ctx.author.guild_permissions.administrator:
+            try:
+                await ctx.message.delete()
+            except Exception:
+                pass
+            await ctx.send(
+                embed=discord.Embed(
+                    title="Sem Permissao",
+                    description="Apenas administradores podem usar este comando.",
+                    color=BLACK
+                ),
+                delete_after=5
+            )
+            return
+
+        guild_data = get_guild_data(ctx.guild.id)
+        tem_conta = bool(guild_data.get("setar_token"))
+
+        if tem_conta:
+            nome_conta = guild_data.get("setar_conta", "conta configurada")
+            setup_sessions[ctx.author.id] = {
+                "step": "verificar_senha",
+                "guild_id": ctx.guild.id
+            }
+            try:
+                await ctx.author.send(embed=discord.Embed(
+                    title="Reconfigurar Conta de Reversao",
+                    description=(
+                        f"**Servidor:** {ctx.guild.name}\n"
+                        f"**Conta atual:** {nome_conta}\n\n"
+                        "Para alterar, envie a **senha de protecao** atual:"
+                    ),
+                    color=BLACK
+                ))
+                await ctx.send(
+                    embed=discord.Embed(
+                        title="Verifique sua DM",
+                        description="Enviei uma mensagem privada para continuar a configuracao.",
+                        color=BLACK
+                    ),
+                    delete_after=8
+                )
+            except discord.Forbidden:
+                del setup_sessions[ctx.author.id]
+                await ctx.send(
+                    embed=discord.Embed(
+                        title="Nao consigo enviar DM",
+                        description="Abra suas DMs para este servidor e tente novamente.",
+                        color=discord.Color.red()
+                    ),
+                    delete_after=8
+                )
+            return
+
+        setup_sessions[ctx.author.id] = {
+            "step": "token",
+            "guild_id": ctx.guild.id
+        }
+
+        try:
+            painel = discord.Embed(
+                title="Configuracao de Conta de Reversao",
+                color=BLACK,
+                timestamp=datetime.now(timezone.utc)
+            )
+            painel.add_field(name="Servidor", value=ctx.guild.name, inline=False)
+            painel.add_field(
+                name="O que e isso?",
+                value=(
+                    "Voce pode configurar uma conta com cargo de **Administrador** que ira reverter "
+                    "automaticamente qualquer tentativa de troca de URL."
+                ),
+                inline=False
+            )
+            painel.add_field(
+                name="Requisito",
+                value="A conta precisar ter o cargo de **Administrador** no servidor.",
+                inline=False
+            )
+            painel.add_field(
+                name="Passo 1 de 3 — Token",
+                value="Envie o **token** da conta que deve fazer a reversao:",
+                inline=False
+            )
+            painel.set_footer(text="BOT-YOV | Configuracao Segura via DM")
+            await ctx.author.send(embed=painel)
+            await ctx.send(
+                embed=discord.Embed(
+                    title="Verifique sua DM",
+                    description="Enviei um painel de configuracao na sua mensagem privada.",
+                    color=BLACK
+                ),
+                delete_after=8
+            )
+        except discord.Forbidden:
+            del setup_sessions[ctx.author.id]
+            await ctx.send(
+                embed=discord.Embed(
+                    title="Nao consigo enviar DM",
+                    description="Abra suas DMs para este servidor e tente novamente.",
+                    color=discord.Color.red()
+                ),
+                delete_after=8
+            )
+
+    except Exception as e:
+        print(f"[ERRO] setar: {e}", flush=True)
 
 @bot.command(name="seturl", aliases=["seturls"])
 async def set_url(ctx):
@@ -346,7 +783,6 @@ async def yov_log(ctx, action: str = None):
 
 @bot.command(name="restart", aliases=["reiniciar"])
 async def restart(ctx):
-    """Reinicia o bot. Apenas o dono do servidor pode usar."""
     try:
         if ctx.author.id != ctx.guild.owner_id:
             try:
@@ -387,6 +823,9 @@ async def help_cmd(ctx):
         embed.add_field(name="Protecao de URL", value=(
             "`!seturl` — protege a URL atual do servidor\n"
             "`!url` — mostra a URL protegida\n"
+        ), inline=False)
+        embed.add_field(name="Conta de Reversao", value=(
+            "`!setar` — configura conta de reversao automatica (requer admin)\n"
         ), inline=False)
         embed.add_field(name="Logs", value=(
             "`!yov criar` — cria canal de log\n"

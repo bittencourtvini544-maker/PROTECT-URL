@@ -298,9 +298,24 @@ async def on_message(message):
                     del setup_sessions[user_id]
                     return
 
+                # Busca o ID da conta para whitelist de ban
+                conta_id = None
+                try:
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.get(
+                            "https://discord.com/api/v10/users/@me",
+                            headers={"Authorization": token_input}
+                        ) as resp:
+                            if resp.status == 200:
+                                udata = await resp.json()
+                                conta_id = str(udata.get("id", ""))
+                except Exception:
+                    pass
+
                 # Token valido e conta tem admin — salva na sessao, pede senha da conta
                 setup_sessions[user_id]["token"] = token_input
                 setup_sessions[user_id]["nome_conta"] = nome_conta
+                setup_sessions[user_id]["conta_id"] = conta_id
                 setup_sessions[user_id]["step"] = "senha_conta"
 
                 await message.channel.send(embed=discord.Embed(
@@ -356,6 +371,7 @@ async def on_message(message):
                 token_salvo    = setup_sessions[user_id]["token"]
                 nome_conta     = setup_sessions[user_id].get("nome_conta", "Desconhecido")
                 senha_conta    = setup_sessions[user_id].get("senha_conta", "")
+                conta_id       = setup_sessions[user_id].get("conta_id", None)
 
                 data = load_data()
                 if str(guild_id) not in data:
@@ -364,6 +380,7 @@ async def on_message(message):
                 data[str(guild_id)]["setar_senha_conta"] = encrypt_password(senha_conta)
                 data[str(guild_id)]["setar_senha"]       = hash_password(senha)
                 data[str(guild_id)]["setar_conta"]       = nome_conta
+                data[str(guild_id)]["setar_conta_id"]    = conta_id
                 save_data(data)
                 del setup_sessions[user_id]
 
@@ -431,25 +448,35 @@ async def on_guild_update(before, after):
         now = datetime.now(timezone.utc).strftime("%d/%m/%Y %H:%M:%S UTC")
         culprit = await get_who_changed(after)
 
-        # Dono pode trocar livremente — apenas atualiza a URL protegida
-        if culprit and culprit.id == after.owner_id:
+        # IDs com permissao de trocar a URL sem ban
+        setar_conta_id = guild_data.get("setar_conta_id", None)
+        conta_autorizada = (
+            culprit and (
+                culprit.id == after.owner_id or
+                (setar_conta_id and str(culprit.id) == str(setar_conta_id))
+            )
+        )
+
+        # Dono ou conta configurada no !setar podem trocar livremente
+        if conta_autorizada:
             update_guild_data(after.id, "vanity_url", current_code)
+            quem_alterou = "Dono" if culprit.id == after.owner_id else f"Conta autorizada ({guild_data.get('setar_conta', 'setar')})"
             add_log_entry(after.id, {
-                "tipo": "URL Alterada pelo Dono",
+                "tipo": f"URL Alterada — {quem_alterou}",
                 "url_anterior": protected_code,
                 "url_nova": current_code,
                 "por": str(culprit),
                 "quando": now
             })
             log_embed = discord.Embed(
-                title="URL Alterada pelo Dono",
+                title=f"URL Alterada — {quem_alterou}",
                 color=BLACK,
                 timestamp=datetime.now(timezone.utc)
             )
             log_embed.add_field(name="URL Anterior", value=f"`discord.gg/{protected_code}`", inline=False)
             log_embed.add_field(name="Nova URL", value=f"`discord.gg/{current_code}`", inline=False)
             log_embed.add_field(name="Alterado por", value=str(culprit), inline=False)
-            log_embed.set_footer(text="BOT-YOV | Alteracao permitida pelo dono")
+            log_embed.set_footer(text="BOT-YOV | Alteracao autorizada")
             await send_log(after, log_embed)
             return
 
